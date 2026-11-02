@@ -10,9 +10,10 @@ Environment=DEVICE=192.168.178.124
 Environment=FIFO=/run/audiobridge/pcm
 Environment=PORT=8090
 Environment=TITLE=Cast
+Environment=TRANSPORT=hls
 # sovrascrivibile con: /etc/default/audiobridge
 EnvironmentFile=-/etc/default/audiobridge
-ExecStart=/usr/bin/python3 -u /opt/audiobridge/audiobridge.py --device ${DEVICE} --fifo ${FIFO} --http-port ${PORT} --title "${TITLE}"
+ExecStart=/usr/bin/python3 -u /opt/audiobridge/audiobridge.py --device ${DEVICE} --fifo ${FIFO} --http-port ${PORT} --title "${TITLE}" --transport ${TRANSPORT}
 Restart=always
 RestartSec=3
 User=root

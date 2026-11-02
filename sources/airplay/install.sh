@@ -19,6 +19,7 @@ DEVICE=$TARGET
 FIFO=/run/audiobridge/pcm
 PORT=8090
 TITLE=AirPlay
+TRANSPORT=hls
 EOF
 
 install -m 0644 "$ROOT/core/audiobridge.service" /etc/systemd/system/audiobridge.service

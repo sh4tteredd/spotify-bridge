@@ -29,6 +29,7 @@ Usage:
 import argparse
 import math
 import os
+import queue
 import select
 import shutil
 import socket
@@ -151,9 +152,100 @@ def serve_http(directory: str, port: int) -> socketserver.TCPServer:
 
 
 # --------------------------------------------------------------------------- #
+# MP3 progressivo: ffmpeg stdout -> HTTP chunked -> Default Media Receiver
+# --------------------------------------------------------------------------- #
+class Mp3Streamer:
+    """Stream MP3 continuo, senza Content-Length.
+
+    Un lettore unico fa fan-out verso i client con una coda ciascuno: un client
+    lento perde i suoi chunk ma non blocca gli altri.
+    """
+
+    def __init__(self, port: int):
+        self.clients = set()
+        self.lock = threading.Lock()
+        socketserver.TCPServer.allow_reuse_address = True
+        self.httpd = socketserver.ThreadingTCPServer(("0.0.0.0", port),
+                                                    self._handler())
+        self.httpd.daemon_threads = True
+        threading.Thread(target=self.httpd.serve_forever, daemon=True).start()
+
+    def _handler(self):
+        outer = self
+
+        class Handler(http.server.BaseHTTPRequestHandler):
+            protocol_version = "HTTP/1.1"
+
+            def log_message(self, fmt, *args):
+                pass
+
+            def do_GET(self):
+                hdrs = " | ".join(f"{k}: {v}" for k, v in self.headers.items())
+                print(f"[*] {self.command} {self.path} da "
+                      f"{self.client_address[0]} [{hdrs}]", flush=True)
+                if not self.path.startswith("/stream.mp3"):
+                    self.send_error(404)
+                    return
+                self.send_response(200)
+                self.send_header("Content-Type", "audio/mpeg")
+                self.send_header("Cache-Control", "no-cache, no-store")
+                self.send_header("Pragma", "no-cache")
+                # il receiver fa una fetch cross-origin da gstatic.com:
+                # senza CORS il media element rifiuta lo stream
+                self.send_header("Access-Control-Allow-Origin", "*")
+                self.send_header("Access-Control-Expose-Headers",
+                                 "Content-Type, icy-metaint, icy-br, "
+                                 "ice-audio-info, icy-name")
+                self.send_header("Accept-Ranges", "none")
+                self.send_header("Transfer-Encoding", "chunked")
+                self.end_headers()
+                q = queue.Queue(maxsize=400)
+                with outer.lock:
+                    outer.clients.add(q)
+                print(f"[+] client MP3 connesso ({self.client_address[0]})",
+                      flush=True)
+                try:
+                    while True:
+                        try:
+                            chunk = q.get(timeout=20)
+                        except queue.Empty:
+                            break
+                        self.wfile.write(b"%X\r\n" % len(chunk) + chunk + b"\r\n")
+                        self.wfile.flush()
+                except (BrokenPipeError, ConnectionResetError, OSError):
+                    pass
+                finally:
+                    with outer.lock:
+                        outer.clients.discard(q)
+                    print(f"[+] client MP3 disconnesso ({self.client_address[0]})",
+                          flush=True)
+
+        return Handler
+
+    def attach(self, stream) -> None:
+        def reader():
+            while True:
+                try:
+                    chunk = stream.read1(8192)
+                except (ValueError, OSError):
+                    break
+                if not chunk:
+                    break
+                with self.lock:
+                    for q in list(self.clients):
+                        try:
+                            q.put_nowait(chunk)
+                        except queue.Full:
+                            pass
+
+        threading.Thread(target=reader, daemon=True).start()
+
+
+# --------------------------------------------------------------------------- #
 # Cast
 # --------------------------------------------------------------------------- #
-def cast_live(device: str, url: str, title: str) -> bool:
+def cast_live(device: str, url: str, title: str,
+              ctype: str = "application/x-mpegURL") -> bool:
     c = CastClient(device)
     c.send(RECEIVER_ID, CONNECTION_NS, {"type": "CONNECT"})
     c.send(RECEIVER_ID, RECEIVER_NS,
@@ -177,7 +269,7 @@ def cast_live(device: str, url: str, title: str) -> bool:
         "media": {
             "contentId": url,
             "streamType": "LIVE",
-            "contentType": "application/x-mpegURL",
+            "contentType": ctype,
             "metadata": {"type": 0, "metadataType": 0, "title": title},
         },
     })
@@ -204,7 +296,8 @@ def cast_live(device: str, url: str, title: str) -> bool:
 # --------------------------------------------------------------------------- #
 # Watchdog: mantiene viva la sessione Cast
 # --------------------------------------------------------------------------- #
-def _send_load(c, transport: str, url: str, title: str, rid: int) -> None:
+def _send_load(c, transport: str, url: str, title: str, rid: int,
+               ctype: str = "application/x-mpegURL") -> None:
     c.send(transport, MEDIA_NS, {
         "type": "LOAD", "requestId": rid, "autoplay": True,
         "media": {
@@ -216,7 +309,8 @@ def _send_load(c, transport: str, url: str, title: str, rid: int) -> None:
     })
 
 
-def _start_session(device: str, url: str, title: str):
+def _start_session(device: str, url: str, title: str,
+                   ctype: str = "application/x-mpegURL"):
     c = CastClient(device)
     c.send(RECEIVER_ID, CONNECTION_NS, {"type": "CONNECT"})
     c.send(RECEIVER_ID, RECEIVER_NS,
@@ -234,18 +328,37 @@ def _start_session(device: str, url: str, title: str):
         raise RuntimeError("receiver non avviato")
     transport = target["transportId"]
     c.send(transport, CONNECTION_NS, {"type": "CONNECT"})
-    _send_load(c, transport, url, title, 3)
+    _send_load(c, transport, url, title, 3, ctype)
     return c, transport
 
 
-def supervise(device: str, url: str, title: str) -> None:
+def supervise(device: str, url: str, title: str,
+              ctype: str = "application/x-mpegURL") -> None:
     """Crea la sessione e la ricrea ogni volta che il device la chiude."""
     backoff = 2
     while True:
         c, transport = None, None
         try:
-            c, transport = _start_session(device, url, title)
+            c, transport = _start_session(device, url, title, ctype)
             print("[+] sessione Cast avviata", flush=True)
+            if ctype == "audio/mpeg":
+                # Durante un live progressivo il media namespace del Nest Hub
+                # smette di rispondere: qui interessa solo che il receiver
+                # resti aperto, altrimenti si riapre la sessione.
+                while True:
+                    time.sleep(3)
+                    c.send(RECEIVER_ID, RECEIVER_NS,
+                           {"type": "GET_STATUS", "requestId": 98})
+                    try:
+                        m = c.wait_for("RECEIVER_STATUS", 6)
+                    except TimeoutError:
+                        continue
+                    apps = m.get("status", {}).get("applications", [])
+                    if not any(a.get("appId") == DEFAULT_MEDIA_RECEIVER
+                               for a in apps):
+                        print("[!] receiver chiuso, riapro", flush=True)
+                        break
+                continue
             backoff = 2
             noresp = 0
             frozen = 0
@@ -271,7 +384,7 @@ def supervise(device: str, url: str, title: str) -> None:
                     # la sessione non è almeno partita una volta
                     if started:
                         print("[!] nessun media attivo, ricarico", flush=True)
-                        _send_load(c, transport, url, title, 100)
+                        _send_load(c, transport, url, title, 100, ctype)
                         started, frozen, last_t = False, 0, None
                     continue
                 st = sts[0]
@@ -286,7 +399,7 @@ def supervise(device: str, url: str, title: str) -> None:
                         frozen = 0
                     if frozen >= 10:
                         print("[!] riproduzione ferma, ricarico", flush=True)
-                        _send_load(c, transport, url, title, 101)
+                        _send_load(c, transport, url, title, 101, ctype)
                         started, frozen, last_t = False, 0, None
                         time.sleep(3)
                         continue
@@ -294,7 +407,7 @@ def supervise(device: str, url: str, title: str) -> None:
                     if started:
                         print(f"[!] idle ({st.get('idleReason')}), ricarico",
                               flush=True)
-                        _send_load(c, transport, url, title, 102)
+                        _send_load(c, transport, url, title, 102, ctype)
                         started, last_t = False, None
                 last_t = cur
         except KeyboardInterrupt:
@@ -322,14 +435,13 @@ def main() -> int:
     ap.add_argument("--http-port", type=int, default=8090)
     ap.add_argument("--dir", default="/tmp/spotify-hls")
     ap.add_argument("--title", default="Cast")
+    ap.add_argument("--transport", choices=("hls", "mp3"), default="hls",
+                    help="hls = segmenti (stabile, ~10s); mp3 = progressivo (~5s)")
+    ap.add_argument("--bitrate", default="192k", help="bitrate MP3")
     ap.add_argument("--bind", default=None, help="IP announced to the device")
     ap.add_argument("--duration", type=float, default=0,
                     help="stop after N seconds (0 = run forever)")
     args = ap.parse_args()
-
-    os.makedirs(args.dir, exist_ok=True)
-    for f in os.listdir(args.dir):
-        os.unlink(os.path.join(args.dir, f))
 
     bind_ip = args.bind
     if not bind_ip:
@@ -339,48 +451,77 @@ def main() -> int:
             bind_ip = s.getsockname()[0]
         finally:
             s.close()
-    url = f"http://{bind_ip}:{args.http_port}/stream.m3u8"
-
-    serve_http(args.dir, args.http_port)
-    print(f"[+] HTTP HLS su {bind_ip}:{args.http_port}")
-
-    playlist = os.path.join(args.dir, "stream.m3u8")
-    ffmpeg = subprocess.Popen(
-        ["ffmpeg", "-hide_banner", "-loglevel", "error",
-         "-f", "s16le", "-ar", str(RATE), "-ac", str(CHANNELS), "-i", "pipe:0",
-         "-c:a", "aac", "-b:a", "160k", "-ar", str(RATE),
-         "-f", "hls", "-hls_time", "2", "-hls_list_size", "12",
-         "-hls_flags", "delete_segments+omit_endlist",
-         "-hls_segment_filename", os.path.join(args.dir, "seg%d.ts"),
-         playlist],
-        stdin=subprocess.PIPE,
-    )
 
     stop = threading.Event()
-    threading.Thread(target=relay, args=(ffmpeg.stdin, None if args.tone else args.fifo, stop),
-                     daemon=True).start()
 
-    # wait for a playlist with at least two segments
-    deadline = time.time() + 30
-    while time.time() < deadline:
-        if os.path.exists(playlist):
-            try:
-                txt = open(playlist).read()
-            except OSError:
-                txt = ""
-            if txt.count("#EXTINF") >= 2:
-                break
-        time.sleep(0.5)
+    if args.transport == "mp3":
+        url = f"http://{bind_ip}:{args.http_port}/stream.mp3"
+        ctype = "audio/mpeg"
+        streamer = Mp3Streamer(args.http_port)
+        ffmpeg = subprocess.Popen(
+            ["ffmpeg", "-hide_banner", "-loglevel", "error",
+             "-f", "s16le", "-ar", str(RATE), "-ac", str(CHANNELS),
+             "-i", "pipe:0",
+             "-c:a", "libmp3lame", "-b:a", args.bitrate,
+             "-f", "mp3", "-"],
+            stdin=subprocess.PIPE, stdout=subprocess.PIPE,
+        )
+        streamer.attach(ffmpeg.stdout)
+        threading.Thread(target=relay,
+                         args=(ffmpeg.stdin,
+                               None if args.tone else args.fifo, stop),
+                         daemon=True).start()
+        time.sleep(1.5)
+        print(f"[+] stream MP3 {args.bitrate} su {url}", flush=True)
     else:
-        print("[-] playlist non pronta")
-        stop.set()
-        ffmpeg.kill()
-        return 1
+        os.makedirs(args.dir, exist_ok=True)
+        for f in os.listdir(args.dir):
+            os.unlink(os.path.join(args.dir, f))
 
-    print(f"[+] playlist pronta: {url}")
+        url = f"http://{bind_ip}:{args.http_port}/stream.m3u8"
+        ctype = "application/x-mpegURL"
+        serve_http(args.dir, args.http_port)
+        print(f"[+] HTTP HLS su {bind_ip}:{args.http_port}", flush=True)
+
+        playlist = os.path.join(args.dir, "stream.m3u8")
+        ffmpeg = subprocess.Popen(
+            ["ffmpeg", "-hide_banner", "-loglevel", "error",
+             "-f", "s16le", "-ar", str(RATE), "-ac", str(CHANNELS),
+             "-i", "pipe:0",
+             "-c:a", "aac", "-b:a", "160k", "-ar", str(RATE),
+             "-f", "hls", "-hls_time", "2", "-hls_list_size", "12",
+             "-hls_flags", "delete_segments+omit_endlist",
+             "-hls_segment_filename", os.path.join(args.dir, "seg%d.ts"),
+             playlist],
+            stdin=subprocess.PIPE,
+        )
+
+        threading.Thread(target=relay,
+                         args=(ffmpeg.stdin,
+                               None if args.tone else args.fifo, stop),
+                         daemon=True).start()
+
+        # wait for a playlist with at least two segments
+        deadline = time.time() + 30
+        while time.time() < deadline:
+            if os.path.exists(playlist):
+                try:
+                    txt = open(playlist).read()
+                except OSError:
+                    txt = ""
+                if txt.count("#EXTINF") >= 2:
+                    break
+            time.sleep(0.5)
+        else:
+            print("[-] playlist non pronta")
+            stop.set()
+            ffmpeg.kill()
+            return 1
+
+        print(f"[+] playlist pronta: {url}", flush=True)
 
     if args.duration:
-        ok = cast_live(args.device, url, args.title)
+        ok = cast_live(args.device, url, args.title, ctype)
         time.sleep(args.duration)
         stop.set()
         ffmpeg.terminate()
@@ -388,7 +529,7 @@ def main() -> int:
         return 0 if ok else 1
 
     try:
-        supervise(args.device, url, args.title)
+        supervise(args.device, url, args.title, ctype)
     except KeyboardInterrupt:
         pass
     finally:
