@@ -1,0 +1,16 @@
+[Unit]
+Description=Cast bridge relay -> Nest Hub (192.168.178.124)
+After=network-online.target avahi-daemon.service
+Wants=network-online.target
+
+[Service]
+Type=simple
+# mDNS e' gestito da avahi (vedi avahi-googlecast.service), qui solo il relay TCP
+ExecStart=/usr/bin/python3 /opt/castbridge/castbridge.py --target 192.168.178.124 --no-mdns
+Restart=always
+RestartSec=3
+User=root
+NoNewPrivileges=false
+
+[Install]
+WantedBy=multi-user.target
