@@ -29,6 +29,7 @@ Usage:
 import argparse
 import math
 import os
+import select
 import shutil
 import socket
 import struct
@@ -76,41 +77,50 @@ def _tone_chunk(phase: float) -> tuple[bytes, float]:
 
 
 def relay(ffmpeg_stdin, fifo: str | None, stop: threading.Event) -> None:
+    """PCM -> ffmpeg stdin.
+
+    Non inietta silenzio solo perché la FIFO è vuota in questo istante:
+    shairport-sync e librespot scrivono a burst, quindi un read vuoto non
+    significa pausa. Si aspetta IDLE secondi di inattività reale prima di
+    generare silenzio, altrimenti si creano buchi dentro l'audio.
+    """
     fd = None
     if fifo:
         if not os.path.exists(fifo):
             os.mkfifo(fifo)
         fd = os.open(fifo, os.O_RDONLY | os.O_NONBLOCK)
-        print(f"[+] FIFO {fifo} aperta (silenzio iniettato se inattiva)")
+        print(f"[+] FIFO {fifo} aperta (silenzio solo dopo inattività)",
+              flush=True)
 
+    IDLE = 0.25                      # secondi di silenzio per ciclo di inattività
+    silence = _silence(int(BYTES_PER_SEC * IDLE))
     phase = 0.0
-    pending = b""
+
     try:
         while not stop.is_set():
-            data = b""
-            if fd is not None:
-                try:
-                    data = os.read(fd, CHUNK * 4)
-                except BlockingIOError:
-                    data = b""
-            else:
+            if fd is None:                      # modalità --tone
                 data, phase = _tone_chunk(phase)
-
-            if not data:
-                # no PCM from librespot (paused / not playing): keep the
-                # live stream alive with silence
-                ffmpeg_stdin.write(_silence(CHUNK))
+                ffmpeg_stdin.write(data)
                 ffmpeg_stdin.flush()
-                time.sleep(0.05)
+                time.sleep(IDLE)
                 continue
 
-            pending += data
-            # send whole 50 ms blocks, keep the remainder
-            while len(pending) >= CHUNK:
-                ffmpeg_stdin.write(pending[:CHUNK])
-                pending = pending[CHUNK:]
+            try:
+                ready, _, _ = select.select([fd], [], [], IDLE)
+            except InterruptedError:
+                continue
+
+            if ready:
+                data = os.read(fd, 1 << 16)
+                if data:
+                    ffmpeg_stdin.write(data)
+                    ffmpeg_stdin.flush()
+                    continue
+                # EOF: nessuno scrittore sulla FIFO
+                time.sleep(IDLE)
+
+            ffmpeg_stdin.write(silence)
             ffmpeg_stdin.flush()
-            time.sleep(0.02)
     except (BrokenPipeError, ValueError):
         pass
     finally:
@@ -338,7 +348,7 @@ def main() -> int:
         ["ffmpeg", "-hide_banner", "-loglevel", "error",
          "-f", "s16le", "-ar", str(RATE), "-ac", str(CHANNELS), "-i", "pipe:0",
          "-c:a", "aac", "-b:a", "160k", "-ar", str(RATE),
-         "-f", "hls", "-hls_time", "4", "-hls_list_size", "20",
+         "-f", "hls", "-hls_time", "2", "-hls_list_size", "12",
          "-hls_flags", "delete_segments+omit_endlist",
          "-hls_segment_filename", os.path.join(args.dir, "seg%d.ts"),
          playlist],
