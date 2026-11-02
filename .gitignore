@@ -4,3 +4,5 @@ __pycache__/
 cert.pem
 key.pem
 .DS_Store
+.crates.toml
+.crates2.json
