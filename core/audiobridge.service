@@ -1,0 +1,21 @@
+[Unit]
+Description=Audio bridge: PCM -> HLS -> Google Cast
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+RuntimeDirectory=audiobridge
+Environment=DEVICE=192.168.178.124
+Environment=FIFO=/run/audiobridge/pcm
+Environment=PORT=8090
+Environment=TITLE=Cast
+# sovrascrivibile con: /etc/default/audiobridge
+EnvironmentFile=-/etc/default/audiobridge
+ExecStart=/usr/bin/python3 -u /opt/audiobridge/audiobridge.py --device ${DEVICE} --fifo ${FIFO} --http-port ${PORT} --title "${TITLE}"
+Restart=always
+RestartSec=3
+User=root
+
+[Install]
+WantedBy=multi-user.target

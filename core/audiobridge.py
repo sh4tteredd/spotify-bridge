@@ -40,8 +40,9 @@ import time
 import http.server
 import socketserver
 
-sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)),
-                                "..", "poc"))
+_HERE = os.path.dirname(os.path.abspath(__file__))
+sys.path.insert(0, _HERE)                      # installato: cast_audio.py accanto
+sys.path.insert(0, os.path.join(_HERE, "..", "poc"))   # repo: ../poc
 
 from cast_audio import (
     CastClient, CONNECTION_NS, MEDIA_NS, RECEIVER_ID, RECEIVER_NS,
@@ -315,12 +316,12 @@ def supervise(device: str, url: str, title: str) -> None:
 def main() -> int:
     ap = argparse.ArgumentParser()
     ap.add_argument("--device", required=True)
-    ap.add_argument("--fifo", default="/tmp/librespot.pcm")
+    ap.add_argument("--fifo", default="/run/audiobridge/pcm")
     ap.add_argument("--tone", action="store_true",
                     help="generate a test melody instead of reading the FIFO")
     ap.add_argument("--http-port", type=int, default=8090)
     ap.add_argument("--dir", default="/tmp/spotify-hls")
-    ap.add_argument("--title", default="Spotify")
+    ap.add_argument("--title", default="Cast")
     ap.add_argument("--bind", default=None, help="IP announced to the device")
     ap.add_argument("--duration", type=float, default=0,
                     help="stop after N seconds (0 = run forever)")

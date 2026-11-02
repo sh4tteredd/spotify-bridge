@@ -1,0 +1,16 @@
+[Unit]
+Description=AirPlay source (shairport-sync -> PCM FIFO)
+After=audiobridge.service
+Requires=audiobridge.service
+Conflicts=spotify-source.service
+
+[Service]
+Type=simple
+# il backend stdout di shairport-sync scrive PCM S16LE 44.1kHz su stdout
+ExecStart=/bin/sh -c 'until [ -p /run/audiobridge/pcm ]; do sleep 0.5; done; exec /usr/local/bin/shairport-sync > /run/audiobridge/pcm'
+Restart=always
+RestartSec=3
+User=root
+
+[Install]
+WantedBy=multi-user.target

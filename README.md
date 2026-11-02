@@ -1,81 +1,73 @@
 # spotify-bridge
 
-Far suonare **Spotify** su un **Google Nest Hub** che non si fa scoprire e che
-non ha il receiver Spotify.
+Far suonare **Spotify** e **AirPlay** su un **Google Nest Hub** che non si fa
+scoprire e che non ha il receiver Spotify.
 
-Due problemi indipendenti, due soluzioni indipendenti:
+## Architettura
 
-| Problema | Sintomo | Soluzione |
-|---|---|---|
-| Il device non ha responder mDNS | nessuna app lo vede tra i dispositivi Cast | `bridge/` — annuncio mDNS + relay TCP |
-| Il device rifiuta l'app Spotify | `LAUNCH_ERROR NOT_FOUND` su `CC32E753` | `spotify/` — Spotify Connect + HLS verso il Default Media Receiver |
+Un core indipendente dalla sorgente e due pacchetti sorgente, mutuamente
+esclusivi: non serve — e non è possibile — tenerli attivi insieme.
 
 ```
-                    ┌──────────────────────────────────────────────┐
-   Spotify app ────►│ librespot ("Cucina Audio")                   │
-                    │   PCM ─► FIFO ─► ffmpeg ─► HLS (:8090)       │
-                    └───────────────────────────────┬──────────────┘
-                                                    │ CASTV2 LOAD
-                                                    ▼
-   App Cast  ────►  bridge (mDNS + relay :8009) ──► Nest Hub (:8009)
-   (Netflix, YouTube, Plex)                         (192.168.178.124)
+                 ┌──────────────────────────────┐
+  librespot ────►│                              │
+  (Spotify)      │   core/audiobridge           │
+                 │   PCM -> ffmpeg -> HLS       │──CASTV2──► Nest Hub
+  shairport ────►│   watchdog sulla sessione    │            (CC1AD845)
+  (AirPlay)      └──────────────────────────────┘
 ```
+
+| Cartella | Ruolo |
+|---|---|
+| `core/` | PCM → HLS → Cast. Unico motore, ~300 righe, nessuna dipendenza dalla sorgente |
+| `sources/airplay/` | shairport-sync 5.x, backend `stdout` |
+| `sources/spotify/` | librespot, backend `subprocess` |
+| `bridge/` | annuncio mDNS + relay Cast (per far ricomparire il device nelle app) |
+| `dist/` | librespot precompilato per aarch64 (musl, statico) |
+| `poc/` | strumenti di analisi e verifica |
+
+## Installazione
+
+```bash
+# AirPlay
+sudo sources/airplay/install.sh 192.168.178.124
+
+# oppure Spotify (serve /usr/local/bin/librespot, vedi dist/)
+sudo sources/spotify/install.sh 192.168.178.124
+```
+
+Ogni `install.sh` installa anche il core.
+
+## Cambiare sorgente
+
+Le due unit hanno `Conflicts=` reciproco: avviarne una ferma l'altra. Per
+rendere la scelta persistente al boot:
+
+```bash
+sudo systemctl disable --now spotify-source
+sudo systemctl enable --now airplay-source
+```
+
+## Perché due pacchetti
+
+Il core è identico per entrambe le sorgenti: duplicarlo significherebbe
+correggere ogni bug due volte. La separazione è quindi tra **sorgenti**, non nel
+motore. `sources/spotify` e `sources/airplay` sono pacchetti installabili in modo
+indipendente e non possono collidere, grazie a `Conflicts=`.
 
 ## Requisiti
 
 - `python3` (solo standard library)
 - `ffmpeg` con encoder AAC
-- `librespot` (per la parte Spotify) — oppure il binario precompilato in `dist/`
-  per aarch64 Linux (musl, statico, nessuna dipendenza da ALSA/OpenSSL)
-- **Spotify Premium** per il flusso Connect
+- `shairport-sync` (AirPlay) oppure `librespot` (Spotify)
+- Spotify Premium per la sorgente Spotify
 
-## Avvio rapido (Spotify)
+## Latenza
 
-```bash
-cd spotify
-./run.sh 192.168.178.124
-# poi in Spotify seleziona "Cucina Audio"
-```
-
-## Struttura
-
-```
-bridge/     annuncio _googlecast._tcp + relay TCP verso il device
-spotify/    Spotify Connect -> PCM -> HLS -> Cast
-poc/        strumenti di analisi e verifica (Cast v2, mDNS, API di setup)
-dist/       librespot precompilato per aarch64 Linux (musl, statico)
-```
-
-| File | Cosa fa |
-|---|---|
-| `bridge/castbridge.py` | responder mDNS + relay 8008/8009/8443, con modalità `--inspect` |
-| `bridge/avahi-googlecast.service` | equivalente per Raspberry Pi / Linux con Avahi |
-| `bridge/castbridge.service` | unit systemd del relay |
-| `bridge/install-pi.sh` | installazione su Raspberry Pi OS |
-| `spotify/spotify_cast.py` | PCM → HLS → cast, con iniezione di silenzio |
-| `spotify/fifo_writer.sh` | wrapper per il backend `subprocess` di librespot |
-| `spotify/run.sh` | avvia l'intera pipeline |
-| `poc/cast_audio.py` | cast di un file audio (usato come libreria) |
-| `poc/cast_monitor.py` | monitor dello stato del device |
-| `poc/cast_probe_apps.py` | quali receiver il device accetta |
-| `poc/castv2_probe.py` | connessione CASTV2 e `GET_STATUS` |
-| `poc/discovery_probe.py` | chi risponde a SSDP/mDNS sulla LAN |
-| `poc/eureka_tls.py` | lettura dell'API di setup su `:8443` |
-
-## Note tecniche
-
-- Il device non annuncia `_googlecast._tcp`: `bridge/` sintetizza l'annuncio.
-- Il device non ha il receiver Spotify: `spotify/` evita del tutto Cast per
-  Spotify e usa il Default Media Receiver (`CC1AD845`), che funziona.
-- Il backend `pipe` di librespot scrive su stdout e ci mescola i messaggi: usare
-  `subprocess` con un wrapper.
-- Latenza attesa: 4–6 s.
-
-Ogni cartella ha il proprio README con dettagli, problemi incontrati e comandi
-di verifica.
+~10 s con HLS (2 s AirPlay + ~6 s di segmenti + buffer del device). Il limite è
+strutturale nel trasporto HLS; per scendere a ~5-6 s servirebbe uno stream MP3
+progressivo al posto dei segmenti.
 
 ## Stato
 
-Verificato su Google Nest Hub, firmware `1.56.332325`, da macOS (Apple Silicon).
-La pipeline Spotify è stata confermata funzionante con audio reale; il bridge
-Cast è stato verificato con un sender di test.
+Verificato su Google Nest Hub, firmware `1.56.332325`, DietPi aarch64 su Pi 3.

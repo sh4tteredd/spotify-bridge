@@ -1,0 +1,17 @@
+[Unit]
+Description=Spotify source (librespot -> PCM FIFO)
+After=audiobridge.service
+Requires=audiobridge.service
+Conflicts=airplay-source.service
+
+[Service]
+Type=simple
+# il backend subprocess scrive il PCM tramite fifo_writer.sh; stdout resta
+# libero per i log (con -B pipe finirebbero dentro lo stream audio)
+ExecStart=/bin/sh -c 'until [ -p /run/audiobridge/pcm ]; do sleep 0.5; done; exec /usr/local/bin/librespot -n "Cucina Audio" -B subprocess -d /opt/audiobridge/fifo_writer.sh -b 320 --cache /var/cache/librespot'
+Restart=always
+RestartSec=5
+User=root
+
+[Install]
+WantedBy=multi-user.target
