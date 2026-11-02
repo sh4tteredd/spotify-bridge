@@ -25,7 +25,8 @@ Due problemi indipendenti, due soluzioni indipendenti:
 
 - `python3` (solo standard library)
 - `ffmpeg` con encoder AAC
-- `librespot` (per la parte Spotify)
+- `librespot` (per la parte Spotify) — oppure il binario precompilato in `dist/`
+  per aarch64 Linux (musl, statico, nessuna dipendenza da ALSA/OpenSSL)
 - **Spotify Premium** per il flusso Connect
 
 ## Avvio rapido (Spotify)
@@ -42,6 +43,7 @@ cd spotify
 bridge/     annuncio _googlecast._tcp + relay TCP verso il device
 spotify/    Spotify Connect -> PCM -> HLS -> Cast
 poc/        strumenti di analisi e verifica (Cast v2, mDNS, API di setup)
+dist/       librespot precompilato per aarch64 Linux (musl, statico)
 ```
 
 | File | Cosa fa |
