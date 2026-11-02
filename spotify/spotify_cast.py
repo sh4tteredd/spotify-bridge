@@ -191,6 +191,108 @@ def cast_live(device: str, url: str, title: str) -> bool:
 
 
 # --------------------------------------------------------------------------- #
+# Watchdog: mantiene viva la sessione Cast
+# --------------------------------------------------------------------------- #
+def _send_load(c, transport: str, url: str, title: str, rid: int) -> None:
+    c.send(transport, MEDIA_NS, {
+        "type": "LOAD", "requestId": rid, "autoplay": True,
+        "media": {
+            "contentId": url,
+            "streamType": "LIVE",
+            "contentType": "application/x-mpegURL",
+            "metadata": {"type": 0, "metadataType": 0, "title": title},
+        },
+    })
+
+
+def _start_session(device: str, url: str, title: str):
+    c = CastClient(device)
+    c.send(RECEIVER_ID, CONNECTION_NS, {"type": "CONNECT"})
+    c.send(RECEIVER_ID, RECEIVER_NS,
+           {"type": "SET_VOLUME", "volume": {"level": 0.6}, "requestId": 1})
+    c.send(RECEIVER_ID, RECEIVER_NS,
+           {"type": "LAUNCH", "appId": DEFAULT_MEDIA_RECEIVER, "requestId": 2})
+    status = c.wait_for(
+        "RECEIVER_STATUS", 20,
+        predicate=lambda m: any(a.get("appId") == DEFAULT_MEDIA_RECEIVER
+                                for a in m.get("status", {}).get("applications", [])),
+    )
+    apps = status.get("status", {}).get("applications", [])
+    target = next((a for a in apps if a.get("appId") == DEFAULT_MEDIA_RECEIVER), None)
+    if not target:
+        raise RuntimeError("receiver non avviato")
+    transport = target["transportId"]
+    c.send(transport, CONNECTION_NS, {"type": "CONNECT"})
+    _send_load(c, transport, url, title, 3)
+    return c, transport
+
+
+def supervise(device: str, url: str, title: str) -> None:
+    """Crea la sessione e la ricrea ogni volta che il device la chiude."""
+    backoff = 2
+    while True:
+        c, transport = None, None
+        try:
+            c, transport = _start_session(device, url, title)
+            print("[+] sessione Cast avviata", flush=True)
+            backoff = 2
+            noresp = 0
+            frozen = 0
+            last_t = None
+            while True:
+                time.sleep(2)
+                try:
+                    c.send(transport, MEDIA_NS,
+                           {"type": "GET_STATUS", "requestId": 99})
+                    m = c.wait_for("MEDIA_STATUS", 6)
+                except TimeoutError:
+                    noresp += 1
+                    if noresp >= 2:
+                        print("[!] receiver non risponde, riapro la sessione",
+                              flush=True)
+                        break
+                    continue
+                noresp = 0
+                sts = m.get("status") or []
+                if not sts:
+                    print("[!] nessun media attivo, ricarico", flush=True)
+                    _send_load(c, transport, url, title, 100)
+                    frozen, last_t = 0, None
+                    continue
+                st = sts[0]
+                state = st.get("playerState")
+                cur = st.get("currentTime") or 0
+                if state == "PLAYING":
+                    if last_t is not None and cur - last_t < 0.2:
+                        frozen += 1
+                    else:
+                        frozen = 0
+                    if frozen >= 5:
+                        print("[!] riproduzione ferma, ricarico", flush=True)
+                        _send_load(c, transport, url, title, 101)
+                        frozen, last_t = 0, None
+                elif state == "IDLE":
+                    print(f"[!] idle ({st.get('idleReason')}), ricarico",
+                          flush=True)
+                    _send_load(c, transport, url, title, 102)
+                    last_t = None
+                last_t = cur
+        except KeyboardInterrupt:
+            raise
+        except Exception as exc:
+            print(f"[!] {type(exc).__name__}: {exc} — riconnetto fra {backoff}s",
+                  flush=True)
+            time.sleep(backoff)
+            backoff = min(backoff * 2, 30)
+        finally:
+            if c is not None:
+                try:
+                    c.sock.close()
+                except OSError:
+                    pass
+
+
+# --------------------------------------------------------------------------- #
 def main() -> int:
     ap = argparse.ArgumentParser()
     ap.add_argument("--device", required=True)
@@ -256,9 +358,9 @@ def main() -> int:
         return 1
 
     print(f"[+] playlist pronta: {url}")
-    ok = cast_live(args.device, url, args.title)
 
     if args.duration:
+        ok = cast_live(args.device, url, args.title)
         time.sleep(args.duration)
         stop.set()
         ffmpeg.terminate()
@@ -266,12 +368,13 @@ def main() -> int:
         return 0 if ok else 1
 
     try:
-        while True:
-            time.sleep(1)
+        supervise(args.device, url, args.title)
     except KeyboardInterrupt:
+        pass
+    finally:
         stop.set()
         ffmpeg.terminate()
-    return 0 if ok else 1
+    return 0
 
 
 if __name__ == "__main__":

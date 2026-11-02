@@ -6,7 +6,7 @@ Wants=network-online.target
 [Service]
 Type=simple
 WorkingDirectory=/opt/spotify-bridge/spotify
-ExecStart=/usr/bin/python3 /opt/spotify-bridge/spotify/spotify_cast.py --device 192.168.178.124 --fifo /tmp/librespot.pcm --http-port 8090 --title Spotify
+ExecStart=/usr/bin/python3 -u /opt/spotify-bridge/spotify/spotify_cast.py --device 192.168.178.124 --fifo /tmp/librespot.pcm --http-port 8090 --title Spotify
 Restart=always
 RestartSec=3
 User=root
