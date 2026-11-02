@@ -238,6 +238,7 @@ def supervise(device: str, url: str, title: str) -> None:
             backoff = 2
             noresp = 0
             frozen = 0
+            started = False
             last_t = None
             while True:
                 time.sleep(2)
@@ -255,27 +256,35 @@ def supervise(device: str, url: str, title: str) -> None:
                 noresp = 0
                 sts = m.get("status") or []
                 if not sts:
-                    print("[!] nessun media attivo, ricarico", flush=True)
-                    _send_load(c, transport, url, title, 100)
-                    frozen, last_t = 0, None
+                    # IDLE transitorio subito dopo il LOAD: ignorare finché
+                    # la sessione non è almeno partita una volta
+                    if started:
+                        print("[!] nessun media attivo, ricarico", flush=True)
+                        _send_load(c, transport, url, title, 100)
+                        started, frozen, last_t = False, 0, None
                     continue
                 st = sts[0]
                 state = st.get("playerState")
                 cur = st.get("currentTime") or 0
+                if state in ("PLAYING", "BUFFERING"):
+                    started = True
                 if state == "PLAYING":
                     if last_t is not None and cur - last_t < 0.2:
                         frozen += 1
                     else:
                         frozen = 0
-                    if frozen >= 5:
+                    if frozen >= 10:
                         print("[!] riproduzione ferma, ricarico", flush=True)
                         _send_load(c, transport, url, title, 101)
-                        frozen, last_t = 0, None
+                        started, frozen, last_t = False, 0, None
+                        time.sleep(3)
+                        continue
                 elif state == "IDLE":
-                    print(f"[!] idle ({st.get('idleReason')}), ricarico",
-                          flush=True)
-                    _send_load(c, transport, url, title, 102)
-                    last_t = None
+                    if started:
+                        print(f"[!] idle ({st.get('idleReason')}), ricarico",
+                              flush=True)
+                        _send_load(c, transport, url, title, 102)
+                        started, last_t = False, None
                 last_t = cur
         except KeyboardInterrupt:
             raise
@@ -329,7 +338,7 @@ def main() -> int:
         ["ffmpeg", "-hide_banner", "-loglevel", "error",
          "-f", "s16le", "-ar", str(RATE), "-ac", str(CHANNELS), "-i", "pipe:0",
          "-c:a", "aac", "-b:a", "160k", "-ar", str(RATE),
-         "-f", "hls", "-hls_time", "2", "-hls_list_size", "10",
+         "-f", "hls", "-hls_time", "4", "-hls_list_size", "20",
          "-hls_flags", "delete_segments+omit_endlist",
          "-hls_segment_filename", os.path.join(args.dir, "seg%d.ts"),
          playlist],
