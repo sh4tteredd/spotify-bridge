@@ -38,6 +38,20 @@ librespot -n "Cucina Audio" \
 
 Poi in Spotify seleziona **Cucina Audio**.
 
+## Installazione come servizio (DietPi / Raspberry Pi OS)
+
+```bash
+sudo ./install.sh 192.168.178.124
+```
+
+Installa `/opt/spotify-bridge`, crea `/var/cache/librespot`, abilita
+`spotify-cast.service` e `librespot.service` (quest'ultimo solo se
+`/usr/local/bin/librespot` esiste).
+
+Ordine di avvio garantito: `librespot` ha `Requires=` e `After=` su
+`spotify-cast`, perché la FIFO deve avere un lettore prima che la sorgente
+apra lo scrittore (altrimenti il `cat` resta bloccato).
+
 ## Perché questi flag
 
 | Flag | Motivo |
